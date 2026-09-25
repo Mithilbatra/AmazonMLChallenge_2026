@@ -1,0 +1,34 @@
+# FULL architecture on the synthetic demo data, using TINY randomly initialised
+# local transformers (scripts/build_local_tiny_transformer.py) so the complete
+# code path - SupCon bi-encoder + FAISS, DeBERTa-v2-architecture cross-encoder
+# with focal loss and MixDA, cascade, blending - runs offline on a CPU.
+# For the real challenge use config.yaml with mode: full and real pre-trained
+# weights (scripts/download_pretrained.py).
+base: synthetic_baseline.yaml
+run_name: synthetic_full
+mode: full
+biencoder:
+  pretrained: models/pretrained/tiny-bert
+  batch_size: 64
+  epochs: 3
+  lr: 1.0e-3
+  max_length: 48
+  extra_negatives_per_batch: 16
+crossencoder:
+  pretrained: models/pretrained/tiny-deberta
+  batch_size: 32
+  epochs: 2
+  lr: 5.0e-4
+  max_length: 96
+  fp16: false
+blocking:
+  methods:
+    semantic: {enabled: auto, top_k: 20}
+# LightGBM is near-certain on the synthetic data (calibrated probabilities are
+# ~0 or ~1), so the default uncertainty band would send almost nothing to the
+# cross-encoder. For this smoke test every entity's top-3 candidates per source
+# are re-scored so the cascade, CE calibration and blend selection really run.
+cascade:
+  lgb_low: 0.0
+  rescore_confident: true
+  max_per_entity_source: 3

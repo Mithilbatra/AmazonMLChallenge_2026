@@ -1,0 +1,25 @@
+# Baseline mode on the synthetic demo data (scripts/make_synthetic_data.py).
+base: ../config.yaml
+run_name: synthetic_baseline
+mode: baseline
+data:
+  train:
+    source1: data/synthetic/train/source1.tsv
+    source2: data/synthetic/train/source2.tsv
+    source3: data/synthetic/train/source3.tsv
+    labels: data/synthetic/train/labels.tsv
+  test:
+    source1: data/synthetic/test/source1.tsv
+    source2: data/synthetic/test/source2.tsv
+    source3: data/synthetic/test/source3.tsv
+schema:
+  source1: {id: record_id, name: business_name, address: [full_address]}
+  source2: {id: record_id, name: business_name, address: [full_address]}
+  source3: {id: record_id, name: business_name, address: [full_address]}
+  labels:
+    source1_id: source1_id
+    match_columns: [matched_ids]
+splits:
+  fractions: {fit: 0.6, calib: 0.2, holdout: 0.2}
+lightgbm:
+  early_stopping_rounds: 50

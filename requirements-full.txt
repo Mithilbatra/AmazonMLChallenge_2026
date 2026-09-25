@@ -1,0 +1,9 @@
+# Full mode (bi-encoder + cross-encoder). Install on top of requirements.txt.
+-r requirements.txt
+torch>=2.1
+transformers>=4.40
+tokenizers>=0.15
+sentencepiece>=0.1.99    # DeBERTa-v3 tokenizer
+protobuf>=3.20
+faiss-cpu>=1.7.4         # or faiss-gpu
+huggingface_hub>=0.20    # only for the one-time scripts/download_pretrained.py

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# challenge data, trained artefacts and outputs are not versioned
+data/*
+!data/README.md
+models/*
+!models/.gitkeep
+outputs/*
+!outputs/.gitkeep
+*.zip

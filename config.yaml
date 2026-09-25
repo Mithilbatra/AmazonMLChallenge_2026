@@ -1,0 +1,243 @@
+# =============================================================================
+# Amazon ML Challenge 2026 - Business Entity Resolution
+# Main configuration (single source of truth). Other configs can inherit from
+# this file with `base: ../config.yaml` and override only what they change.
+#
+# All relative paths are resolved against the directory you run the commands
+# from (run everything from the repository root).
+#
+# BEFORE THE FIRST REAL RUN: run `python inspect_data.py --config config.yaml`
+# and set the `data:` paths and the `schema:` column names to the ACTUAL
+# challenge files. The transcript does not specify file or column names, so
+# the values below are placeholders.
+# =============================================================================
+
+run_name: default
+# baseline: normalisation -> multi-pass blocking -> features -> LightGBM
+#           -> isotonic calibration -> Macro-F0.5 decision search -> output
+# full:     baseline + SupCon bi-encoder semantic blocking (FAISS)
+#           + Ditto-style DeBERTa-v3 cross-encoder cascade + blending
+mode: baseline
+seed: 42
+n_jobs: 4                     # CPU worker processes for feature computation
+
+paths:
+  models_dir: models          # artefacts -> models/<run_name>/
+  outputs_dir: outputs        # outputs   -> outputs/<run_name>/
+
+data:
+  train:
+    source1: data/train/source1.tsv
+    source2: data/train/source2.tsv
+    source3: data/train/source3.tsv
+    labels: data/train/labels.tsv
+  test:
+    source1: data/test/source1.tsv
+    source2: data/test/source2.tsv
+    source3: data/test/source3.tsv
+  # If the organisers ship a sample submission, point to it; its header then
+  # defines the output columns of matching_results.tsv.
+  sample_submission: null
+
+io:
+  encoding: utf-8-sig         # utf-8 that also strips a BOM if present
+  quoting: minimal            # minimal (pandas default; "quoted" fields) | none (quotes literal)
+
+schema:
+  # Column names per source. `address` is a LIST: several columns
+  # (street, city, state, zip, ...) are joined with `address_join`.
+  source1: {id: id, name: name, address: [address]}
+  source2: {id: id, name: name, address: [address]}
+  source3: {id: id, name: name, address: [address]}
+  address_join: ", "
+  duplicate_ids: warn_keep_first   # error | warn_keep_first
+  labels:
+    source1_id: source1_id
+    # One combined column holding S2 and S3 ids ("comma-separated list of all
+    # its matching IDs"), or one column per source.
+    match_columns: [matches]
+    # Optional explicit mapping {column: 2|3}. null -> ids are resolved to a
+    # source by looking them up in the Source 2 / Source 3 id sets.
+    column_sources: null
+    list_separator: ","
+    missing_source1_policy: singleton   # S1 ids absent from labels: singleton | drop | error
+    ambiguous_id_policy: skip           # id present in BOTH S2 and S3: skip | both | error
+    unknown_id_policy: warn             # id in no source: warn | error
+
+submission:
+  matching_results: matching_results.tsv
+  candidate_pairs: candidate_pairs.tsv
+  scored_candidates: scored_candidates.tsv   # debugging file, not part of the official output
+  id_column: null            # null -> mirror the label file's Source-1 id column
+  match_columns: null        # null -> mirror the label file's match column(s)
+  list_separator: ","
+  list_format: auto          # auto (mirror labels) | plain ("a,b") | bracketed ("[a, b]")
+  candidate_columns:
+    source1_id: source1_id
+    candidate_id: candidate_id
+    candidate_source: candidate_source
+  archive_name: submission.zip
+  methodology_doc: METHODOLOGY.md
+
+normalization:
+  transliterate: false       # romanise non-Latin scripts with `unidecode` (offline table)
+  strip_leading_the: true
+  extra_legal_suffixes: {}   # {canonical: [variant, ...]} e.g. {pty ltd: [proprietary limited]}
+  extra_name_abbreviations: {}      # {variant: canonical}
+  extra_address_abbreviations: {}   # {variant: canonical}
+
+address:
+  parser: auto               # auto (libpostal if installed, else rules) | libpostal | rules
+  extra_states: {}           # {"full state name": "code"}
+  extra_countries: []
+  postcode_patterns: null    # null -> built-in multi-region patterns (see src/address_parser.py)
+
+splits:
+  # Unit of splitting = one Source-1 entity together with ALL of its labelled
+  # Source-2/3 records. fit -> model training; calib -> calibration, blending
+  # and decision search; holdout -> untouched unbiased estimate.
+  fractions: {fit: 0.70, calib: 0.15, holdout: 0.15}
+  inner_val_fraction: 0.15   # share of `fit` entities used only for early stopping
+
+blocking:
+  prefix_length: 4
+  max_block_size: 2000       # key blocks with more vendor records are purged
+  max_candidates_per_source: 60   # final cap per (S1 entity, source)
+  cap_method_bonus: 0.02     # cap rank = name+address TF-IDF cosine + bonus x (#methods that found the pair)
+  chunk_size: 2000
+  char_ngram_range: [2, 4]
+  char_max_df: 0.05          # drop char n-grams in >5% of records (keeps sparse products sparse)
+  word_max_df: 0.10
+  methods:
+    name_prefix:        {enabled: true, top_k: 20}
+    postcode:           {enabled: true, top_k: 20}
+    postcode_phonetic:  {enabled: true, top_k: 20}
+    city_state:         {enabled: true, top_k: 15}
+    phonetic_name:      {enabled: true, top_k: 20}
+    address_key:        {enabled: true, top_k: 20}
+    tfidf_name_char:    {enabled: true, top_k: 25}
+    tfidf_name_word:    {enabled: true, top_k: 15}
+    tfidf_full_char:    {enabled: true, top_k: 25}
+    tfidf_address:      {enabled: true, top_k: 15}
+    minhash_lsh:        {enabled: true, top_k: 20, num_perm: 64, bands: 16, shingle_size: 3, max_bucket_size: 300}
+    semantic:           {enabled: auto, top_k: 30}   # auto -> enabled in full mode only
+
+features:
+  soft_tfidf_threshold: 0.90       # PDF: secondary similarity tolerance 0.90
+  soft_tfidf_secondary: jaro_winkler   # jaro_winkler | levenshtein
+  jw_prefix_weight: 0.1            # PDF: Winkler scaling factor p = 0.1 (prefix capped at 4)
+  context_features: true
+  chunk_size: 200000
+
+training:
+  add_missed_positives: true       # add true pairs lost by blocking to the LightGBM training rows
+  neg_downsample: 1.0              # 1.0 = keep every candidate negative
+
+lightgbm:
+  params:
+    objective: binary
+    learning_rate: 0.05
+    num_leaves: 63
+    min_data_in_leaf: 40
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    lambda_l2: 1.0
+    verbose: -1
+  num_boost_round: 3000
+  early_stopping_rounds: 100
+
+biencoder:
+  # Pre-trained weights must be on local disk (see scripts/download_pretrained.py);
+  # nothing is fetched from the internet during training or matching.
+  pretrained: models/pretrained/all-MiniLM-L6-v2
+  local_files_only: true
+  text_source: normalized          # normalized | raw
+  max_length: 64
+  pooling: mean                    # mean | cls
+  temperature: 0.07
+  batch_size: 128
+  epochs: 5
+  lr: 3.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_positives_per_entity: 4
+  hard_batching: true              # co-locate entities sharing a blocking key in a batch
+  extra_negatives_per_batch: 32    # unlabeled vendor records added as in-batch negatives
+  flood_level: null                # constant Flooding (Ishida et al. 2020). NOT AdaFlood.
+  faiss_index: flat                # flat (exact) | hnsw
+  encode_batch_size: 256
+  device: auto
+
+crossencoder:
+  pretrained: models/pretrained/deberta-v3-base
+  local_files_only: true
+  text_source: raw                 # raw | normalized
+  max_length: 128
+  domain_tags: true                # wrap postcodes / numbers in special tags
+  tfidf_summarize_max_words: 40    # prune lowest-IDF words above this length
+  batch_size: 32
+  eval_batch_size: 128
+  epochs: 3
+  lr: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  focal_gamma: 2.0
+  focal_alpha: null                # null = no class re-weighting
+  mixda:
+    enabled: true
+    alpha: 0.8
+    ops: [del, swap, drop_col, token_del, attr_shuffle, entry_swap]
+  hard_negatives_per_entity: 8
+  random_negatives_per_entity: 2
+  max_train_pairs: 400000
+  device: auto
+  fp16: true                       # mixed precision on GPU (bf16 when supported, else fp16)
+
+cascade:
+  # Only plausible-but-uncertain pairs reach the cross-encoder.
+  lgb_low: 0.02                    # calibrated LightGBM prob below this -> never sent to CE
+  lgb_high: 0.995                  # above this -> accepted on LightGBM score (unless rescore_confident)
+  rescore_confident: false
+  max_per_entity_source: 10        # at most this many pairs per (S1 entity, source) go to the CE
+
+blend:
+  method: auto                     # auto | weighted | rank | stack
+  min_ce_pairs: 200                # blend only if calib has this many cross-encoder-scored pairs
+  min_ce_per_class: 20             # ... with at least this many positives AND negatives
+  weight_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+calibration:
+  method: isotonic                 # isotonic (PDF) | platt | auto (lower CV Brier score)
+  calibrate_blend: true
+
+graph:
+  modes_to_try: ["off", "exclusive", "betweenness"]   # quote "off": bare off is a YAML boolean
+  min_edge_prob: 0.2
+  max_component_size: 50
+
+singleton_model:
+  # Entity-level LightGBM predicting P(at least one true match among the
+  # candidates) from score-distribution features (top-1, top-2, margin, model
+  # agreement, ...). Trained out-of-fold on the calib split only.
+  enabled: true
+  folds: 5
+
+decision:
+  beta: 0.5
+  search: true
+  threshold_grid: {start: 0.05, stop: 0.99, step: 0.01}
+  margins: [1.0, 0.5, 0.3, 0.2, 0.1, 0.05]
+  gate_offsets: [0.0, 0.02, 0.05, 0.1, 0.15, 0.2]
+  max_per_source: [null, 1, 2, 3, 5]
+  # Entity output is emptied when P(matchable) < value. 0.0 disables the gate.
+  matchable_thresholds: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+  per_source_thresholds: true
+  min_improvement: 0.0005          # an extra rule / blend must beat the simpler one by
+  min_entities_gain: 2             #   max(min_improvement, min_entities_gain / #calib entities)
+  rounds: 3
+  # Used only when search: false
+  default: {threshold_s2: 0.5, threshold_s3: 0.5, margin: 1.0, gate: 0.5, max_per_source: null, matchable_threshold: 0.0, graph_mode: "off"}
+
+evaluation:
+  error_analysis_top_n: 200
