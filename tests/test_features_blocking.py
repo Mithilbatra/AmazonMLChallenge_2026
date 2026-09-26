@@ -93,3 +93,26 @@ def test_context_features_rank():
     assert out["ctx_rank"].tolist() == [1, 2, 1]
     assert out["ctx_v_rank"].tolist() == [1, 1, 2]   # vendor 6 has one S1 candidate
     assert out["ctx_mutual_best"].tolist() == [1, 0, 0]
+
+
+def test_feature_matrix_matches_in_memory_features(tiny_tables, tmp_path):
+    from src.features import FeatureMatrix, build_feature_matrix, predict_in_blocks
+    s1, v = tiny_tables
+    pairs = pd.DataFrame({"s1_idx": [0, 0, 0, 1, 2, 2], "v_idx": [0, 1, 3, 2, 4, 5],
+                          "source": [2, 2, 3, 2, 3, 3]})
+    cfg = {**CFG, "features": {**CFG["features"], "chunk_pairs": 2}}   # force several chunks
+    ctx = FeatureContext(s1, v, cfg)
+    mem = compute_features(pairs, s1, v, ctx, cfg)
+    fm = build_feature_matrix(pairs, s1, v, ctx, cfg, str(tmp_path / "f.npy"))
+    assert list(fm.columns) == list(mem.columns)
+    disk = fm.frame()
+    np.testing.assert_allclose(disk.to_numpy(), mem.to_numpy(np.float32), equal_nan=True)
+    again = FeatureMatrix(str(tmp_path / "f.npy"))            # columns reloaded from json
+    sub = again.frame([1, 3], ["name_jw", "pc_eq"])
+    np.testing.assert_allclose(sub.to_numpy(), mem.iloc[[1, 3]][["name_jw", "pc_eq"]].to_numpy(), equal_nan=True)
+
+    class Mean:   # stand-in booster
+        def predict(self, X):
+            return np.nanmean(np.asarray(X, dtype=float), axis=1)
+    cols = ["name_jw", "addr_char_cos"]
+    np.testing.assert_allclose(predict_in_blocks(Mean(), fm, cols, size=4), predict_in_blocks(Mean(), mem, cols, size=4))

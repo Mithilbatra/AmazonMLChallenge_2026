@@ -138,6 +138,14 @@ The mode is chosen on `calib`, and cleanup is used only if it helps. The labels 
 ### 2.11 Output (`src/submission.py`)
 `matching_results.tsv` has one row per Source-1 entity, in the original order. Predicted ids are comma-separated and sorted by score, and the field is empty for predicted singletons. The column names mirror the label file, or follow a configured sample submission. `candidate_pairs.tsv` has the columns `source1_id`, `candidate_id` and `candidate_source`. `scored_candidates.tsv` holds every score and decision for debugging. A local validator checks for tabs, the header, one row per entity, no duplicates, and that every id exists.
 
+### 2.12 Engineering: bounded memory and resumable stages
+The data size of the real challenge is unknown, and the pipeline has to run on ~12–16 GB notebook machines.
+* **Blocking:** each vendor source is blocked, deduplicated and capped before the next source starts. The key-block ranking matrices are limited to about 2M cells, and MinHash-LSH processes Source-1 records in chunks with a running top-k.
+* **Reports and labels:** the blocking report and label attachment use sorted integer pair ids, not Python sets of tuples.
+* **Features:** pairwise features are computed in chunks by one reused worker pool. The parent calls `gc.freeze()` before forking, so the workers do not duplicate its heap. Results are streamed into a disk-backed float32 matrix (`features.npy`, memory-mapped), and LightGBM trains on the needed rows and predicts in blocks.
+* **Stages:** training runs as seven stages and prediction as four. Each stage reads its inputs from checkpoints and writes its outputs back, so a crashed or restarted process resumes (`--resume`, or one notebook cell per stage) without recomputing earlier stages.
+* **Memory release:** freed memory is handed back to the OS after every stage (`malloc_trim`).
+
 ## 3. Design decisions
 
 1. **Normalisation.** Vendors write the same business differently ([T]: "Acme Robotics Incorporated" vs "Inc"). Without normalisation, string similarity and blocking keys fail on formatting alone. Suffixes are removed from the matching key but kept as evidence ([A]).

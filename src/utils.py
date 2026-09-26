@@ -38,16 +38,69 @@ def setup_logging(log_file: str | None = None, level: int = logging.INFO) -> log
     return logger
 
 
+def rss_mb() -> float:
+    """Current resident memory of this process in MB (Linux /proc; else peak)."""
+    try:
+        with open("/proc/self/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
+    except (OSError, ValueError, AttributeError):
+        return peak_rss_mb()
+
+
+def peak_rss_mb() -> float:
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak / 1024 if sys.platform != "darwin" else peak / 2**20
+    except (ImportError, OSError):
+        return float("nan")
+
+
+def release_memory() -> None:
+    """Garbage-collect and hand freed heap pages back to the OS (glibc
+    malloc_trim). Without the trim a long-lived notebook kernel keeps the
+    peak memory of earlier stages reserved."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _proc_status_mb(field: str) -> float | None:
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return None
+
+
+def mem_str() -> str:
+    """Memory report for the logs. On Linux, real process memory (anonymous)
+    is shown separately from pages of memory-mapped files (the disk-backed
+    feature matrix): the latter is page cache the OS can drop at any time and
+    is not what causes out-of-memory kills."""
+    anon, mapped = _proc_status_mb("RssAnon"), _proc_status_mb("RssFile")
+    if anon is None:
+        return f"RSS {rss_mb():,.0f} MB (peak {peak_rss_mb():,.0f} MB)"
+    return f"mem {anon:,.0f} MB (+{mapped:,.0f} MB mapped files; peak total {peak_rss_mb():,.0f} MB)"
+
+
 @contextmanager
 def timer(name: str, store: dict | None = None):
     log = get_logger()
-    log.info(">> %s ...", name)
+    log.info(">> %s ...  [%s]", name, mem_str())
     t0 = time.perf_counter()
     try:
         yield
     finally:
         dt = time.perf_counter() - t0
-        log.info("<< %s done in %.1fs", name, dt)
+        log.info("<< %s done in %.1fs  [%s]", name, dt, mem_str())
         if store is not None:
             store[name] = round(dt, 3)
 

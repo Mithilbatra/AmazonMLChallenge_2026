@@ -17,7 +17,8 @@ import pandas as pd
 from .decision import DecisionParams, DecisionTable, entity_features
 from .graph_cleanup import graph_keep_mask
 from .scoring import cascade_mask
-from .train_lightgbm import load_lightgbm, predict_lightgbm
+from .features import predict_in_blocks
+from .train_lightgbm import load_lightgbm
 from .utils import get_logger, load_json, load_pickle
 
 
@@ -62,12 +63,14 @@ class TrainedPipeline:
         return DittoSerializer(self.cfg, self._serializer_idf)
 
 
-def score_candidates(pairs: pd.DataFrame, feats: pd.DataFrame, s1: pd.DataFrame, v: pd.DataFrame,
+def score_candidates(pairs: pd.DataFrame, feats, s1: pd.DataFrame, v: pd.DataFrame,
                      pipe: TrainedPipeline, ce_rows: np.ndarray | None = None) -> pd.DataFrame:
-    """Return pairs + p_lgb_raw, p_lgb, sent_to_ce, p_ce_raw, p_ce, p_blend, p_final."""
+    """Return pairs + p_lgb_raw, p_lgb, sent_to_ce, p_ce_raw, p_ce, p_blend, p_final.
+
+    `feats` is a DataFrame or a disk-backed FeatureMatrix (scored in blocks)."""
     log = get_logger()
     out = pairs[["s1_idx", "v_idx", "source"]].copy()
-    raw = predict_lightgbm(pipe.booster, feats[pipe.feature_columns])
+    raw = predict_in_blocks(pipe.booster, feats, pipe.feature_columns)
     out["p_lgb_raw"] = raw
     out["p_lgb"] = pipe.cal_lgb.transform(raw)
     out["sent_to_ce"] = False

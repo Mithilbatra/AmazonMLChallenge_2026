@@ -113,7 +113,7 @@ def validate_submission(path: str, s1_ids: list[str], s2_ids: set, s3_ids: set, 
             "predicted_ids": int(n_pred), "empty_rows(predicted_singletons)": int(empty_rows)}
 
 
-DEFAULT_CODE_PATTERNS = ["README.md", "METHODOLOGY.md", "requirements*.txt", "config.yaml", "configs/*.yaml", "pytest.ini",
+DEFAULT_CODE_PATTERNS = ["README.md", "METHODOLOGY.md", "requirements*.txt", "config.yaml", "configs/*.yaml", "pytest.ini", "notebooks/*.ipynb",
                          "*.py", "src/*.py", "scripts/*.py", "tests/*.py"]
 
 

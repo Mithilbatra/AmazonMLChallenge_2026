@@ -32,6 +32,7 @@ dataset being blocked; no label is ever used for blocking.
 """
 from __future__ import annotations
 
+import gc
 import zlib
 
 import numpy as np
@@ -41,7 +42,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 from .config import get, semantic_enabled
 from .metrics import entity_fbeta, reduction_ratio
-from .utils import describe_counts, get_logger
+from .utils import describe_counts, get_logger, mem_str
 
 METHODS = ["name_prefix", "postcode", "postcode_phonetic", "city_state", "phonetic_name",
            "address_key", "tfidf_name_char", "tfidf_name_word", "tfidf_full_char",
@@ -148,23 +149,29 @@ def key_block(s1_keys: np.ndarray, v_keys: np.ndarray, v_global: np.ndarray,
     parts = []
     if small:
         m = s1df[s1df["key"].isin(small)].merge(vdf[vdf["key"].isin(small)], on="key")
-        parts.append(m[["s1_idx", "vpos"]])
+        parts.append(m[["s1_idx", "vpos"]].astype(np.int32))
     if mid:
         s1_groups = s1df[s1df["key"].isin(mid)].groupby("key")["s1_idx"].apply(np.asarray)
         v_groups = vdf[vdf["key"].isin(mid)].groupby("key")["vpos"].apply(np.asarray)
         for key, s1_rows in s1_groups.items():
             v_rows = v_groups[key]
-            S = (rank_s1[s1_rows] @ rank_v[v_rows].T).toarray()
-            kk = min(top_k, S.shape[1])
-            top = np.argpartition(-S, kk - 1, axis=1)[:, :kk]
-            parts.append(pd.DataFrame({"s1_idx": np.repeat(s1_rows, kk), "vpos": v_rows[top].ravel()}))
+            v_block_T = rank_v[v_rows].T.tocsr()
+            kk = min(top_k, len(v_rows))
+            # bound the dense (S1 rows x block) score matrix to ~2M cells
+            row_chunk = max(1, int(2_000_000 // max(1, len(v_rows))))
+            for c in range(0, len(s1_rows), row_chunk):
+                rows = s1_rows[c:c + row_chunk]
+                S = (rank_s1[rows] @ v_block_T).toarray()
+                top = np.argpartition(-S, kk - 1, axis=1)[:, :kk]
+                parts.append(pd.DataFrame({"s1_idx": np.repeat(rows, kk).astype(np.int32),
+                                           "vpos": v_rows[top].ravel().astype(np.int32)}))
     stats = {"blocks": int(len(counts)), "blocks_ranked": len(mid), "blocks_purged": int(len(purged)),
              "vendor_rows_in_purged_blocks": int(purged.sum())}
     if not parts:
         return pd.DataFrame({"s1_idx": [], "v_idx": []}, dtype=np.int64), stats
     out = pd.concat(parts, ignore_index=True)
-    return pd.DataFrame({"s1_idx": out["s1_idx"].to_numpy(np.int64),
-                         "v_idx": v_global[out["vpos"].to_numpy(np.int64)]}), stats
+    return pd.DataFrame({"s1_idx": out["s1_idx"].to_numpy(np.int32),
+                         "v_idx": v_global[out["vpos"].to_numpy(np.int64)].astype(np.int32)}), stats
 
 
 # ---------------------------------------------------------------- MinHash
@@ -217,34 +224,47 @@ def _band_keys(sig: np.ndarray, bands: int) -> np.ndarray:
 
 
 def minhash_block(s1_texts, v_texts, v_global: np.ndarray, top_k: int, num_perm: int, bands: int,
-                  k: int, max_bucket: int) -> tuple[pd.DataFrame, dict]:
+                  k: int, max_bucket: int, s1_chunk: int = 20_000) -> tuple[pd.DataFrame, dict]:
+    """Banded MinHash-LSH. Memory-bounded: Source-1 records are processed in
+    chunks; for each chunk the bucket collisions of ALL bands are gathered,
+    de-duplicated, scored by estimated Jaccard and cut to top-k before the
+    next chunk starts (so pairs never pile up across bands)."""
     sig1, ok1 = minhash_signatures(list(s1_texts), num_perm, k)
     sig2, ok2 = minhash_signatures(list(v_texts), num_perm, k)
     keys1, keys2 = _band_keys(sig1, bands), _band_keys(sig2, bands)
-    parts, purged = [], 0
     idx1, idx2 = np.where(ok1)[0], np.where(ok2)[0]
+    purged = 0
+    vendor_bands = []
     for bi in range(bands):
-        d1 = pd.DataFrame({"s1_idx": idx1, "key": keys1[idx1, bi]})
-        d2 = pd.DataFrame({"vpos": idx2, "key": keys2[idx2, bi]})
+        d2 = pd.DataFrame({"vpos": idx2.astype(np.int32), "key": keys2[idx2, bi]})
         cnt = d2["key"].value_counts()
         big = cnt.index[cnt > max_bucket]
         purged += len(big)
-        d2 = d2[~d2["key"].isin(big)]
-        parts.append(d1.merge(d2, on="key")[["s1_idx", "vpos"]])
-    if not parts:
-        return pd.DataFrame({"s1_idx": [], "v_idx": []}, dtype=np.int64), {}
-    pairs = pd.concat(parts, ignore_index=True).drop_duplicates()
-    if pairs.empty:
-        return pd.DataFrame({"s1_idx": [], "v_idx": []}, dtype=np.int64), {"buckets_purged": purged}
-    a = pairs["s1_idx"].to_numpy()
-    bpos = pairs["vpos"].to_numpy()
-    est = np.empty(len(pairs), dtype=np.float32)
-    for s in range(0, len(pairs), 500_000):
-        est[s:s + 500_000] = (sig1[a[s:s + 500_000]] == sig2[bpos[s:s + 500_000]]).mean(axis=1)
-    pairs = pairs.assign(sim=est).sort_values(["s1_idx", "sim"], ascending=[True, False])
-    pairs = pairs.groupby("s1_idx", sort=False).head(top_k)
-    return (pd.DataFrame({"s1_idx": pairs["s1_idx"].to_numpy(np.int64),
-                          "v_idx": v_global[pairs["vpos"].to_numpy(np.int64)]}),
+        vendor_bands.append(d2[~d2["key"].isin(big)])
+    out = []
+    for c in range(0, len(idx1), s1_chunk):
+        rows = idx1[c:c + s1_chunk]
+        parts = []
+        for bi in range(bands):
+            d1 = pd.DataFrame({"s1_idx": rows.astype(np.int32), "key": keys1[rows, bi]})
+            parts.append(d1.merge(vendor_bands[bi], on="key")[["s1_idx", "vpos"]])
+        pairs = pd.concat(parts, ignore_index=True).drop_duplicates()
+        del parts
+        if pairs.empty:
+            continue
+        a = pairs["s1_idx"].to_numpy()
+        bpos = pairs["vpos"].to_numpy()
+        est = np.empty(len(pairs), dtype=np.float32)
+        for s in range(0, len(pairs), 200_000):
+            est[s:s + 200_000] = (sig1[a[s:s + 200_000]] == sig2[bpos[s:s + 200_000]]).mean(axis=1)
+        pairs = pairs.assign(sim=est).sort_values(["s1_idx", "sim"], ascending=[True, False])
+        out.append(pairs.groupby("s1_idx", sort=False).head(top_k)[["s1_idx", "vpos"]])
+    if not out:
+        return pd.DataFrame({"s1_idx": np.zeros(0, np.int32), "v_idx": np.zeros(0, np.int32)}), \
+            {"buckets_purged": int(purged)}
+    res = pd.concat(out, ignore_index=True)
+    return (pd.DataFrame({"s1_idx": res["s1_idx"].to_numpy(np.int32),
+                          "v_idx": v_global[res["vpos"].to_numpy(np.int64)].astype(np.int32)}),
             {"buckets_purged": int(purged)})
 
 
@@ -276,7 +296,6 @@ class Blocker:
         max_block = int(b.get("max_block_size", 2000))
         chunk = int(b.get("chunk_size", 2000))
         stats: dict = {"methods": {}}
-        frames = []
 
         s1_keys = {
             "name_prefix": np.where(s1["name_nospace"].str.len() >= 2,
@@ -304,11 +323,16 @@ class Blocker:
         tfidf_rep = {"tfidf_name_char": "name_char", "tfidf_name_word": "name_word",
                      "tfidf_full_char": "full_char", "tfidf_address": "addr_char"}
 
+        cap = int(b.get("max_candidates_per_source", 60))
+        bonus = float(b.get("cap_method_bonus", 0.02))
+        mh_chunk = int(self.methods_cfg.get("minhash_lsh", {}).get("s1_chunk", 20_000))
+        capped_parts, precap_parts = [], []
         for source in (2, 3):
             vmask = (v["source"] == source).to_numpy()
             v_global = np.where(vmask)[0]
             if len(v_global) == 0:
                 continue
+            frames = []
             for method in METHODS:
                 if not self._enabled(method):
                     continue
@@ -321,58 +345,81 @@ class Blocker:
                 elif method in tfidf_rep:
                     rep = tfidf_rep[method]
                     r, c, _ = sparse_topk(reps.s1(rep), reps.v(rep)[v_global], k, chunk)
-                    df = pd.DataFrame({"s1_idx": r, "v_idx": v_global[c]})
+                    df = pd.DataFrame({"s1_idx": r.astype(np.int32), "v_idx": v_global[c].astype(np.int32)})
                 elif method == "minhash_lsh":
                     mc = self.methods_cfg.get("minhash_lsh", {})
                     df, mstats = minhash_block(s1["name_nospace"], v.loc[vmask, "name_nospace"], v_global, k,
                                                int(mc.get("num_perm", 64)), int(mc.get("bands", 16)),
                                                int(mc.get("shingle_size", 3)),
-                                               int(mc.get("max_bucket_size", 300)))
+                                               int(mc.get("max_bucket_size", 300)), mh_chunk)
                 elif method == "semantic":
                     if semantic_retriever is None:
                         log.warning("semantic blocking enabled but no retriever supplied - skipped")
                         continue
-                    df = semantic_retriever.search(s1, v, source, k)[["s1_idx", "v_idx"]]
+                    df = semantic_retriever.search(s1, v, source, k)[["s1_idx", "v_idx"]].astype(np.int32)
                 else:  # pragma: no cover
                     continue
-                df = df.assign(bit=METHOD_BIT[method])
+                df = df.astype(np.int32)
+                df["bit"] = np.int32(METHOD_BIT[method])
                 frames.append(df)
                 stats["methods"][f"{method}_s{source}"] = {"pairs": int(len(df)), **mstats}
-                log.info("  blocking %-18s source %d -> %9d pairs", method, source, len(df))
+                log.info("  blocking %-18s source %d -> %9d pairs  [%s]", method, source, len(df), mem_str())
+            if not frames:
+                continue
+            # union of this source's methods -> one row per pair with a bit mask
+            allp = pd.concat(frames, ignore_index=True)
+            del frames
+            allp = allp.drop_duplicates(["s1_idx", "v_idx", "bit"])
+            cs = allp.groupby(["s1_idx", "v_idx"], sort=False)["bit"].sum().reset_index()
+            del allp
+            gc.collect()
+            cs.rename(columns={"bit": "blk_flags"}, inplace=True)
+            cs["source"] = np.int8(source)
+            ia, ib = cs["s1_idx"].to_numpy(np.int64), cs["v_idx"].to_numpy(np.int64)
+            # Cap ranking: joint name+address similarity plus a small bonus per
+            # independent method that retrieved the pair. (Ranking by name
+            # similarity alone lets many same-name branches of a common business
+            # push the true, address-matching record out of the cap.)
+            flags = cs["blk_flags"].to_numpy()
+            n_methods = sum(((flags & bit) > 0).astype(np.float32) for bit in METHOD_BIT.values())
+            cs["blk_score"] = (rowwise_cosine(reps.s1("full_char"), reps.v("full_char"), ia, ib)
+                               + bonus * n_methods).astype(np.float32)
+            precap_parts.append(cs[["s1_idx", "v_idx", "source", "blk_flags"]].copy())
+            cs = cs.sort_values(["s1_idx", "blk_score"], ascending=[True, False])
+            capped_parts.append(cs.groupby("s1_idx", sort=False).head(cap).reset_index(drop=True))
+            log.info("  source %d union: %d pairs before cap, %d after cap  [%s]", source,
+                     len(cs), len(capped_parts[-1]), mem_str())
+            del cs
+            gc.collect()
 
-        if not frames:
+        if not capped_parts:
             raise RuntimeError("No blocking method produced candidates - check blocking.methods")
-        allp = pd.concat(frames, ignore_index=True)
-        allp["s1_idx"] = allp["s1_idx"].astype(np.int64)
-        allp["v_idx"] = allp["v_idx"].astype(np.int64)
-        allp = allp.drop_duplicates(["s1_idx", "v_idx", "bit"])
-        cand = allp.groupby(["s1_idx", "v_idx"], sort=False)["bit"].sum().reset_index()
-        cand.rename(columns={"bit": "blk_flags"}, inplace=True)
-        cand["source"] = v["source"].to_numpy()[cand["v_idx"].to_numpy()]
-        ia, ib = cand["s1_idx"].to_numpy(), cand["v_idx"].to_numpy()
-        # Cap ranking: joint name+address similarity plus a small bonus per
-        # independent method that retrieved the pair. (Ranking by name
-        # similarity alone lets many same-name branches of a common business
-        # push the true, address-matching record out of the cap.)
-        flags = cand["blk_flags"].to_numpy()
-        n_methods = sum(((flags & bit) > 0).astype(np.float32) for bit in METHOD_BIT.values())
-        bonus = float(b.get("cap_method_bonus", 0.02))
-        cand["blk_score"] = rowwise_cosine(reps.s1("full_char"), reps.v("full_char"), ia, ib) + bonus * n_methods
-        precap = cand[["s1_idx", "v_idx", "source", "blk_flags"]].copy()
-        cap = int(b.get("max_candidates_per_source", 60))
-        cand = cand.sort_values(["s1_idx", "source", "blk_score"], ascending=[True, True, False])
-        cand = cand.groupby(["s1_idx", "source"], sort=False).head(cap).reset_index(drop=True)
+        del reps
+        cand = pd.concat(capped_parts, ignore_index=True)
+        precap = pd.concat(precap_parts, ignore_index=True)
+        del capped_parts, precap_parts
+        cand["s1_idx"] = cand["s1_idx"].astype(np.int64)
+        cand["v_idx"] = cand["v_idx"].astype(np.int64)
         for m in METHODS:
             cand[f"blk_{m}"] = ((cand["blk_flags"].to_numpy() & METHOD_BIT[m]) > 0).astype(np.int8)
         cand["n_methods"] = cand[[f"blk_{m}" for m in METHODS]].sum(axis=1).astype(np.int16)
         cand = cand.sort_values(["s1_idx", "source", "v_idx"]).reset_index(drop=True)
         stats["pairs_before_cap"] = int(len(precap))
         stats["pairs_after_cap"] = int(len(cand))
-        log.info("Blocking union: %d pairs before cap, %d after cap (%d per source)", len(precap), len(cand), cap)
+        log.info("Blocking union: %d pairs before cap, %d after cap (%d per source)  [%s]",
+                 len(precap), len(cand), cap, mem_str())
         return cand, precap, stats
 
 
 # ------------------------------------------------------------ evaluation
+def _in_sorted(values: np.ndarray, sorted_ref: np.ndarray) -> np.ndarray:
+    """Vectorised membership test of int64 pair ids against a sorted array."""
+    if len(sorted_ref) == 0:
+        return np.zeros(len(values), dtype=bool)
+    pos = np.minimum(np.searchsorted(sorted_ref, values), len(sorted_ref) - 1)
+    return sorted_ref[pos] == values
+
+
 def blocking_report(cand: pd.DataFrame, precap: pd.DataFrame | None, s1: pd.DataFrame, v: pd.DataFrame,
                     li=None, split: np.ndarray | None = None, beta: float = 0.5) -> dict:
     """Pair completeness, reduction ratio, candidate distribution, lost matches,
@@ -403,9 +450,11 @@ def blocking_report(cand: pd.DataFrame, precap: pd.DataFrame | None, s1: pd.Data
         return rep
 
     tp = li.true_pairs.merge(v[["v_idx", "source"]], on="v_idx")
-    key = lambda df: set(zip(df["s1_idx"].to_numpy(), df["v_idx"].to_numpy()))
-    cand_set = key(cand)
-    found = np.array([(a, b) in cand_set for a, b in zip(tp["s1_idx"], tp["v_idx"])], dtype=bool)
+    nv = max(1, len(v))
+    tp_pid = tp["s1_idx"].to_numpy(np.int64) * nv + tp["v_idx"].to_numpy(np.int64)
+    cand_pid = np.sort(cand["s1_idx"].to_numpy(np.int64) * nv + cand["v_idx"].to_numpy(np.int64))
+    found = _in_sorted(tp_pid, cand_pid)
+    del cand_pid
     tp = tp.assign(found=found)
     rep["true_pairs_resolved"] = int(len(tp))
     rep["pair_completeness"] = float(found.mean()) if len(tp) else float("nan")
@@ -414,12 +463,18 @@ def blocking_report(cand: pd.DataFrame, precap: pd.DataFrame | None, s1: pd.Data
         m = tp["source"] == s
         rep[f"pair_completeness_s{s}"] = float(tp.loc[m, "found"].mean()) if m.any() else float("nan")
     if precap is not None:
-        pre_set = key(precap)
-        pre_found = np.array([(a, b) in pre_set for a, b in zip(tp["s1_idx"], tp["v_idx"])], dtype=bool)
-        rep["pair_completeness_before_cap"] = float(pre_found.mean()) if len(tp) else float("nan")
+        pre_pid = precap["s1_idx"].to_numpy(np.int64) * nv + precap["v_idx"].to_numpy(np.int64)
+        order = np.argsort(pre_pid)
+        pre_sorted, flags_sorted = pre_pid[order], precap["blk_flags"].to_numpy()[order]
+        del pre_pid, order
+        pos = np.searchsorted(pre_sorted, tp_pid)
+        pos_ok = pos < len(pre_sorted)
+        hit = np.zeros(len(tp_pid), dtype=bool)
+        hit[pos_ok] = pre_sorted[pos[pos_ok]] == tp_pid[pos_ok]
+        tp_flags = np.where(hit, flags_sorted[np.minimum(pos, max(0, len(pre_sorted) - 1))], 0).astype(np.int64) \
+            if len(pre_sorted) else np.zeros(len(tp_pid), np.int64)
+        rep["pair_completeness_before_cap"] = float(hit.mean()) if len(tp) else float("nan")
         rep["pairs_before_cap"] = int(len(precap))
-        flags = precap.set_index(["s1_idx", "v_idx"])["blk_flags"]
-        tp_flags = flags.reindex(list(zip(tp["s1_idx"], tp["v_idx"]))).fillna(0).astype(np.int64).to_numpy()
         pc_flags = precap["blk_flags"].to_numpy()
         method_stats = {}
         for m in METHODS:

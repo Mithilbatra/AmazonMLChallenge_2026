@@ -138,18 +138,31 @@ def attach_labels(pairs: pd.DataFrame, li: LabelIndex, v: pd.DataFrame) -> pd.Se
 
     A candidate whose id appears in the entity's label list but could not be
     resolved unambiguously is marked -1, so a true match can NEVER be used as
-    a negative.
+    a negative. Fully vectorised (no Python loop over the candidate pairs).
     """
-    tp = set(zip(li.true_pairs["s1_idx"].to_numpy(), li.true_pairs["v_idx"].to_numpy()))
-    keys = metric_key_series(v, li.key_mode).to_numpy()
-    s1_idx = pairs["s1_idx"].to_numpy()
-    v_idx = pairs["v_idx"].to_numpy()
+    nv = max(1, len(v))
+    s1_idx = pairs["s1_idx"].to_numpy(np.int64)
+    v_idx = pairs["v_idx"].to_numpy(np.int64)
+    pid = s1_idx * nv + v_idx
+    tp_pid = np.sort(li.true_pairs["s1_idx"].to_numpy(np.int64) * nv + li.true_pairs["v_idx"].to_numpy(np.int64))
     out = np.zeros(len(pairs), dtype=np.int8)
-    for i, (a, b) in enumerate(zip(s1_idx, v_idx)):
-        if (a, b) in tp:
-            out[i] = 1
-        elif keys[b] in li.true_keys[a]:
-            out[i] = -1
+    if len(tp_pid):
+        pos = np.minimum(np.searchsorted(tp_pid, pid), len(tp_pid) - 1)
+        out[tp_pid[pos] == pid] = 1
+    # id listed in the entity's truth but not resolved to this record -> uncertain
+    truth = pd.DataFrame([(e, k) for e, keys in enumerate(li.true_keys) for k in keys],
+                         columns=["s1_idx", "mkey"])
+    if len(truth):
+        # only non-positive candidates of entities that HAVE true ids can be uncertain
+        ent_has = np.zeros(len(li.true_keys), dtype=bool)
+        ent_has[truth["s1_idx"].to_numpy()] = True
+        rows = np.flatnonzero((out == 0) & ent_has[s1_idx])
+        keys = metric_key_series(v, li.key_mode).to_numpy()
+        cand = pd.DataFrame({"s1_idx": s1_idx[rows], "mkey": keys[v_idx[rows]], "row": rows})
+        hit = cand.merge(truth, on=["s1_idx", "mkey"])["row"].to_numpy()
+        listed = np.zeros(len(pairs), dtype=bool)
+        listed[hit] = True
+        out[listed & (out == 0)] = -1
     return pd.Series(out, index=pairs.index, name="label")
 
 

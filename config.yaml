@@ -68,6 +68,7 @@ submission:
   matching_results: matching_results.tsv
   candidate_pairs: candidate_pairs.tsv
   scored_candidates: scored_candidates.tsv   # debugging file, not part of the official output
+  write_scored_candidates: true
   id_column: null            # null -> mirror the label file's Source-1 id column
   match_columns: null        # null -> mirror the label file's match column(s)
   list_separator: ","
@@ -119,7 +120,8 @@ blocking:
     tfidf_name_word:    {enabled: true, top_k: 15}
     tfidf_full_char:    {enabled: true, top_k: 25}
     tfidf_address:      {enabled: true, top_k: 15}
-    minhash_lsh:        {enabled: true, top_k: 20, num_perm: 64, bands: 16, shingle_size: 3, max_bucket_size: 300}
+    minhash_lsh:        {enabled: true, top_k: 20, num_perm: 64, bands: 16, shingle_size: 3, max_bucket_size: 300,
+                         s1_chunk: 20000}   # S1 records per LSH chunk (bounds memory)
     semantic:           {enabled: auto, top_k: 30}   # auto -> enabled in full mode only
 
 features:
@@ -127,7 +129,9 @@ features:
   soft_tfidf_secondary: jaro_winkler   # jaro_winkler | levenshtein
   jw_prefix_weight: 0.1            # PDF: Winkler scaling factor p = 0.1 (prefix capped at 4)
   context_features: true
-  chunk_size: 200000
+  chunk_pairs: 250000              # pairs per feature chunk (lower = less RAM)
+  predict_block: 500000            # rows per LightGBM prediction block
+  keep_matrix: true                # keep checkpoints/features.npy (disk) after the run
 
 training:
   add_missed_positives: true       # add true pairs lost by blocking to the LightGBM training rows

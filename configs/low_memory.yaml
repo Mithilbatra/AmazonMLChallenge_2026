@@ -1,0 +1,27 @@
+# Memory-saving overlay for machines with ~12-16 GB RAM (Colab / Kaggle).
+#   python train.py --config configs/low_memory.yaml --set data.train.source1=...   (or edit paths in config.yaml)
+# Every setting trades a little speed or recall for a smaller peak; check the
+# blocking report (pair completeness before/after cap) to see what the lower
+# candidate cap costs on YOUR data.
+base: ../config.yaml
+n_jobs: 2                         # fewer worker processes
+blocking:
+  max_candidates_per_source: 30   # fewer candidate pairs -> smaller feature matrix
+  chunk_size: 500                 # S1 rows per sparse TF-IDF product
+  max_block_size: 1000
+  methods:
+    minhash_lsh: {enabled: true, top_k: 20, num_perm: 64, bands: 16, shingle_size: 3, max_bucket_size: 200,
+                  s1_chunk: 5000}
+features:
+  chunk_pairs: 100000
+  predict_block: 200000
+training:
+  neg_downsample: 0.3             # LightGBM sees all positives + 30% of negatives (calibration uses all)
+submission:
+  write_scored_candidates: false  # skip the large debugging file
+crossencoder:
+  batch_size: 16
+  eval_batch_size: 64
+biencoder:
+  batch_size: 64
+  encode_batch_size: 128

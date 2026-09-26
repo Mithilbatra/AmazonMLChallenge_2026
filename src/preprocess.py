@@ -7,6 +7,7 @@ Produces two tables per dataset:
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from .address_parser import ADDRESS_FIELDS, AddressParser
@@ -15,16 +16,22 @@ from .utils import get_logger
 
 
 def _apply_unique(values: pd.Series, fn, fields: list[str]) -> pd.DataFrame:
-    """Run `fn` once per unique string (vendor data is highly repetitive)."""
-    uniques = pd.unique(values)
-    parsed = {u: fn(u) for u in uniques}
-    rows = [parsed[x] for x in values]
-    return pd.DataFrame(rows, columns=fields, index=values.index)
+    """Run `fn` once per unique string (vendor data is highly repetitive) and
+    broadcast the parsed columns back with integer codes (no per-row dicts)."""
+    codes, uniques = pd.factorize(values, sort=False)
+    parsed = [fn(u) for u in uniques]
+    out = {}
+    for f in fields:
+        col = np.array([p[f] for p in parsed], dtype=object)
+        out[f] = col[codes] if len(codes) else col[:0]
+    del parsed
+    return pd.DataFrame(out, index=values.index)
 
 
 def normalize_records(df: pd.DataFrame, normalizer: NameNormalizer, parser: AddressParser) -> pd.DataFrame:
-    names = _apply_unique(df["name"], normalizer, NAME_FIELDS)
-    addrs = _apply_unique(df["address"], parser, ADDRESS_FIELDS)
+    # the batch path is already de-duplicated -> bypass the per-call LRU caches
+    names = _apply_unique(df["name"], getattr(normalizer, "_normalize", normalizer), NAME_FIELDS)
+    addrs = _apply_unique(df["address"], getattr(parser, "_parse", parser), ADDRESS_FIELDS)
     out = pd.concat([df.reset_index(drop=True), names.reset_index(drop=True),
                      addrs.reset_index(drop=True)], axis=1)
     out["full_text"] = (out["name_core"] + " " + out["addr_clean"]).str.strip()

@@ -13,6 +13,53 @@ Everything runs **offline**. No external database, API, geocoder or lookup is us
 
 ---
 
+## 0. Notebooks (Colab / Kaggle / Jupyter)
+
+The whole pipeline is also available as two **self-contained notebooks**. They don't need the repository to be cloned:
+
+| notebook | what it does |
+|---|---|
+| `notebooks/01_train.ipynb` | installs missing packages, writes the pipeline code (one `%%writefile` cell per module), configuration, **one cell per training stage**, holdout results and error analysis |
+| `notebooks/02_predict_and_submit.ipynb` | same setup, then one cell per prediction stage, `candidate_pairs.tsv`, `matching_results.tsv`, validation and `submission.zip` |
+
+How to use them:
+1. Upload both notebooks.
+2. In the **Config** cell, set `DATA_DIR` to your TSV folder, set the column names, and pick `RUN_NAME`, `MODE` and `LOW_MEMORY`.
+3. Run everything top to bottom, in `01_train` first and then in `02_predict_and_submit`.
+4. Both notebooks must use the same `WORK_DIR` and `RUN_NAME`. On Colab, put `WORK_DIR` on Google Drive (there is a commented line in the setup cell), because two notebooks otherwise run on different machines.
+
+To try a notebook first without the real data, set `USE_SYNTHETIC_DEMO = True`.
+
+**If the kernel dies:** every stage writes its results to `outputs/<RUN_NAME>/…/checkpoints/`. Restart the kernel, re-run sections 0–2 (setup, code, config), and continue from the first stage that did not finish. Each stage prints the current and peak memory, so you can see where it is tight.
+
+The notebooks are generated from `src/` by `scripts/build_notebooks.py`, and a test fails if they are out of date. Edit `src/`, never the notebook copies of it, and then regenerate:
+
+```bash
+python scripts/build_notebooks.py
+```
+
+## Memory
+
+Everything is designed to run on a ~12–16 GB machine. On a 100k-entity synthetic stress test, real memory peaks at **5.9 GB** with the default config and at **3.0 GB** with `configs/low_memory.yaml` (details in section 7):
+- Blocking processes Source 2 and Source 3 one after the other. It bounds the key-block and MinHash-LSH working sets, and uses vectorised pair ids instead of Python sets.
+- Features are computed in chunks and written to a disk-backed `features.npy`, so the feature table never has to fit in RAM.
+- LightGBM scores in blocks, and prediction writes its debug file in blocks.
+- Freed memory is returned to the OS after every stage.
+
+If memory is still tight, use `configs/low_memory.yaml` (the notebooks default to it): `python train.py --config configs/low_memory.yaml`. It lowers:
+- the candidate cap (30 per source),
+- the chunk sizes,
+- the number of worker processes (2),
+- the share of negatives LightGBM trains on (30%).
+
+After a crash, the command line resumes too:
+
+```bash
+python train.py --config config.yaml --resume             # skip the stages that already finished
+python train.py --config config.yaml --stages lightgbm,decide   # re-run chosen stages only
+python predict.py --config config.yaml --stages features,score
+```
+
 ## 1. Quick start (synthetic demo, about 1 minute on CPU)
 
 ```bash
@@ -24,7 +71,7 @@ python evaluate.py --config configs/synthetic_baseline.yaml        # holdout met
 python evaluate.py --config configs/synthetic_baseline.yaml \
        --predictions outputs/synthetic_baseline/test/matching_results.tsv \
        --labels data/synthetic/test_labels_HIDDEN.tsv                # score test predictions (demo only)
-python -m pytest -q                                                 # 50 tests, including an end-to-end run
+python -m pytest -q                                                 # 54 tests, incl. end-to-end + notebook runs
 ```
 
 Full mode on the demo data uses tiny, randomly initialised local transformers, so no download is needed:
@@ -108,7 +155,12 @@ Upload `outputs/<run>/test/matching_results.tsv` to the leaderboard. At the end,
 │   ├── train_lightgbm.py  train_biencoder.py  train_crossencoder.py
 │   ├── calibration.py  scoring.py  decision.py  graph_cleanup.py  metrics.py
 │   ├── training.py  inference.py  prediction.py  submission.py  error_analysis.py
+├── notebooks/
+│   ├── 01_train.ipynb                    self-contained training notebook (generated from src/)
+│   └── 02_predict_and_submit.ipynb       self-contained prediction + submission notebook
+├── configs/low_memory.yaml               memory-saving overlay (~12-16 GB machines)
 ├── scripts/
+│   ├── build_notebooks.py                regenerates notebooks/ from src/ (--check verifies they are current)
 │   ├── make_synthetic_data.py            synthetic dataset with the challenge's structure
 │   ├── build_local_tiny_transformer.py   offline tiny BERT / DeBERTa-v2 checkpoints (smoke tests)
 │   └── download_pretrained.py            one-time download of DeBERTa-v3 / MiniLM weights
@@ -156,20 +208,38 @@ The file names and output columns are configurable in `submission:`. By default 
 
 ## 7. What has actually been verified, and what has not
 
-Verified in this repository's environment (CPU only, no internet access to HuggingFace):
+Verified in this repository's environment (4 CPU cores, 15 GB RAM, no internet access to HuggingFace):
 
-* `pytest`: 50 tests pass. They cover normalisation, suffix extraction, address parsing (including the PDF's parsing table), features, blocking, label parsing, Macro F0.5, decision rules, graph cleanup, output writing / validation, and a full train → predict → score run.
+* `pytest`: 54 tests pass. They cover:
+  * normalisation, suffix extraction, and address parsing (including the PDF's parsing table);
+  * features, including exact equality between the disk-backed matrix and the in-memory features;
+  * blocking, label parsing, Macro F0.5, decision rules and graph cleanup;
+  * output writing and validation, a full train → predict → score run, and resumable stages;
+  * **both notebooks executed end to end in a real Jupyter kernel**.
 * Both modes run end to end on the **synthetic** demo data (800 train / 400 test Source-1 entities). These numbers only show that the code works; they say **nothing** about challenge performance.
 
   | synthetic demo | holdout Macro F0.5 | test Macro F0.5 (hidden synthetic labels) |
   |---|---|---|
   | baseline | 0.9916 | 0.9918 |
-  | full (tiny *untrained* transformers) | 0.9856 | 0.9877 |
+  | full (tiny *untrained* transformers) | 0.9927 | 0.9876 |
 
-  The full-mode row uses randomly initialised 300k-parameter models. The pipeline correctly detects that blending with them does not help and keeps LightGBM alone. The gap to baseline is 1–2 entities on a 160-entity split.
-* A 20k-entity synthetic stress test (2.4M candidate pairs) trains in about 3.5 minutes on 4 CPU cores. It was used to fix two real problems: the candidate-cap ranking (pair completeness after the cap rose from 0.957 to 0.996) and a hot loop in Soft-TFIDF (2.8× faster).
+  The full-mode row uses randomly initialised 300k-parameter models. The pipeline correctly detects that blending with them does not help and keeps LightGBM alone.
+* **Memory stress test:** 100k training / 30k test Source-1 entities (about 117k + 112k training vendor records and 12M candidate pairs), synthetic. The full baseline pipeline, all 7 training and 4 prediction stages, completes on this 15 GB machine. Peak *real* memory per stage (system "used" memory minus idle, including worker processes; memory-mapped page cache excluded):
 
-**Not verified:** anything on the real challenge data (it was not available), and full mode with real DeBERTa-v3 / MiniLM weights (the HuggingFace hub was unreachable here). No leaderboard score, real dataset size, threshold or runtime is claimed. When you run `train.py` on the real data, the reports listed above give all of these numbers for your data.
+  | stage | default `config.yaml` | `configs/low_memory.yaml` |
+  |---|---|---|
+  | train: prepare | ~1.7 GB | 1.4 GB |
+  | train: blocking | ~3.3 GB | 3.0 GB |
+  | train: features (12M / 6M pairs) | 4.8 GB | 2.9 GB |
+  | train: lightgbm | 5.9 GB | 1.8 GB |
+  | train: decide | 3.6 GB | 2.2 GB |
+  | predict: every stage | ≤ 2.2 GB | ≤ 1.5 GB |
+
+  The stage logs print `mem X MB (+Y MB mapped files ...)`. X is real memory. Y is pages of the disk-backed feature matrix, which the OS drops when it needs the RAM. The peak process RSS that includes those mapped pages was 11 GB with the default config, but that is not memory pressure. On the synthetic test labels, the low-memory run scored 0.9935 Macro F0.5 against 0.9952 for the default run.
+
+  Before these changes, the blocking stage alone reached 5.4 GB and the features stage 6.1 GB of real memory (10.5 GB RSS), and the growth was worst in the Source-3 part of blocking.
+
+**Not verified:** anything on the real challenge data (it was not available), and full mode with real DeBERTa-v3 / MiniLM weights (the HuggingFace hub was unreachable here). No leaderboard score, real dataset size, threshold or runtime is claimed. When you run the pipeline on the real data, the reports listed above give all of these numbers for your data.
 
 ## 8. Tests
 

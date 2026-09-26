@@ -223,6 +223,8 @@ def search_decision(table: DecisionTable, dcfg: dict, graph_modes: list[str] | N
 
 
 # ------------------------------------------------------ singleton model
+# pair-level feature columns that entity_features() reads (besides the scores)
+ENTITY_INPUT_COLUMNS = ["name_jw", "addr_char_cos", "contradictions", "ctx_mutual_best"]
 ENTITY_FEATURES = ["top1", "top2", "margin12", "n_ge_03", "n_ge_05", "n_ge_07", "n_ge_09", "n_cands",
                    "top1_s2", "top1_s3", "top1_lgb", "top1_ce", "top1_model_gap", "top1_name_jw",
                    "top1_addr_cos", "top1_contradictions", "top1_mutual_best", "mean_p", "has_ce"]
@@ -265,7 +267,10 @@ def entity_features(scored: pd.DataFrame, entity_idx: np.ndarray, prob_col: str 
 
 _SINGLETON_PARAMS = {"objective": "binary", "learning_rate": 0.05, "num_leaves": 15, "min_data_in_leaf": 10,
                      "feature_fraction": 0.9, "bagging_fraction": 0.9, "bagging_freq": 1, "lambda_l2": 1.0,
-                     "verbose": -1}
+                     "verbose": -1,
+                     # tiny data: a single thread avoids OpenMP spin-wait slowdowns
+                     # when other processes share the CPU (seen: 289 s vs 0.2 s)
+                     "num_threads": 1}
 
 
 def train_singleton_model(ent_feats: pd.DataFrame, y: np.ndarray, folds: int = 5, seed: int = 42,

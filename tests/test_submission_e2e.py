@@ -72,3 +72,26 @@ def test_end_to_end_baseline(tmp_path):
               "--predictions", str(tmp_path / "outputs/e2e/test/matching_results.tsv"),
               "--labels", str(data / "test_labels_HIDDEN.tsv"))
     assert '"macro_f0.5"' in out.stdout
+
+
+@pytest.mark.slow
+def test_training_stages_resume(tmp_path):
+    """Stages write checkpoints; --resume skips completed stages; re-running a
+    stage invalidates the later ones."""
+    data = tmp_path / "data"
+    run = lambda *a: subprocess.run([sys.executable, *a], cwd=ROOT, check=True, capture_output=True, text=True)
+    run("scripts/make_synthetic_data.py", "--out", str(data), "--n-train", "150", "--n-test", "60")
+    ov = []
+    for s in (1, 2, 3):
+        ov += ["--set", f"data.train.source{s}={data}/train/source{s}.tsv"]
+    ov += ["--set", f"data.train.labels={data}/train/labels.tsv", "--set", f"paths.models_dir={tmp_path}/m",
+           "--set", f"paths.outputs_dir={tmp_path}/o", "--set", "run_name=st", "--set", "n_jobs=1"]
+    run("train.py", "--config", "configs/synthetic_baseline.yaml", "--stages", "prepare,blocking", *ov)
+    ck = tmp_path / "o/st/train/checkpoints"
+    assert (ck / "prepare.done").exists() and (ck / "blocking.done").exists()
+    assert not (ck / "features.done").exists()
+    out = run("train.py", "--config", "configs/synthetic_baseline.yaml", "--resume", *ov)
+    assert "already done" in out.stdout and "Holdout Macro F0.5" in out.stdout
+    assert (tmp_path / "m/st/pipeline.json").exists() and (ck / "features.npy").exists()
+    run("train.py", "--config", "configs/synthetic_baseline.yaml", "--stages", "features", *ov)
+    assert (ck / "features.done").exists() and not (ck / "decide.done").exists()
